@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="RateLimitedProxy.Api/RateLimitedProxy.Api.csproj" />
+  <Project Path="RateLimitedProxy.Tests/RateLimitedProxy.Tests.csproj" />
+</Solution>
