@@ -1,4 +1,4 @@
-using RateLimitedProxy.Api.Models;
+using RateLimitedProxy.Api.Services;
 using Scalar.AspNetCore;
 
 var builder = WebApplication.CreateBuilder(args);

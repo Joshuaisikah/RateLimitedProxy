@@ -1,4 +1,4 @@
-namespace RateLimitedProxy.Api.Models;
+namespace RateLimitedProxy.Api.Services;
 
 public class Metrics
 {

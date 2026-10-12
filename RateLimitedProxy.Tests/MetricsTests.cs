@@ -1,4 +1,4 @@
-using RateLimitedProxy.Api.Models;
+using RateLimitedProxy.Api.Services;
 
 namespace RateLimitedProxy.Tests;
 
