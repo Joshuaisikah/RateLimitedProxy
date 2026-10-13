@@ -4,6 +4,10 @@ public class Metrics
 {
     private long _totalRequests;
     private long _totalErrors;
+    private long _totalRejected;
+    public long TotalRejected => Interlocked.Read(ref _totalRejected);
+
+    public void RecordRejected() => Interlocked.Increment(ref _totalRejected);
 
     //public method that takes the status code;
     public void ProcessRequest(int statusCode)

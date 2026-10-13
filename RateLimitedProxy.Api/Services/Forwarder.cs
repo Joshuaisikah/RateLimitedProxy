@@ -7,11 +7,17 @@ public class Forwarder
 {
     private readonly HttpClient _httpClient;
     private readonly UpstreamOptions _options;
+    private readonly ConcurrencyLimiter _concurrencyLimiter;
 
-    public Forwarder(HttpClient httpClient, IOptions<UpstreamOptions> options)
+    public Forwarder(
+        HttpClient httpClient,
+        IOptions<UpstreamOptions> options,
+        ConcurrencyLimiter concurrencyLimiter
+    )
     {
         _httpClient = httpClient;
         _options = options.Value;
+        _concurrencyLimiter = concurrencyLimiter;
     }
 
     public async Task<HttpResponseMessage> ForwardRequestAsync(
@@ -25,28 +31,39 @@ public class Forwarder
     {
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         cts.CancelAfter(TimeSpan.FromMilliseconds(_options.TimeoutMs));
-        var target = new Uri(path + query, UriKind.Relative);
-        using var request = new HttpRequestMessage(new HttpMethod(method), target);
-        if (body != null)
+        try
         {
-            request.Content = new StreamContent(body);
+            await _concurrencyLimiter.WaitAsync(cts.Token);
         }
-        var skip = HopByHopHeaders.NamedInConnection(headers);
-        foreach (var (name, value) in headers)
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            if (HopByHopHeaders.IsHopByHop(name) || skip.Contains(name))
-                continue;
-            if (!request.Headers.TryAddWithoutValidation(name, value.ToArray()))
-                request.Content?.Headers.TryAddWithoutValidation(name, value.ToArray());
+            throw new ProxyBusyException();
         }
         try
         {
-            var response = await _httpClient.SendAsync(request, cts.Token);
-            return response;
+            var target = new Uri(path + query, UriKind.Relative);
+            using var request = new HttpRequestMessage(new HttpMethod(method), target);
+            if (body != null)
+            {
+                request.Content = new StreamContent(body);
+            }
+            var skip = HopByHopHeaders.NamedInConnection(headers);
+            foreach (var (name, value) in headers)
+            {
+                if (HopByHopHeaders.IsHopByHop(name) || skip.Contains(name))
+                    continue;
+                if (!request.Headers.TryAddWithoutValidation(name, value.ToArray()))
+                    request.Content?.Headers.TryAddWithoutValidation(name, value.ToArray());
+            }
+            return await _httpClient.SendAsync(request, cts.Token);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             throw new UpstreamTimeoutException();
+        }
+        finally
+        {
+            _concurrencyLimiter.Release();
         }
     }
 }

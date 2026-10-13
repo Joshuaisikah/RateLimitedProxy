@@ -14,6 +14,7 @@ namespace RateLimitedProxy.Tests;
 //   /status/{code}  -> responds with that status, body "status {code}", header X-Upstream: fake
 //   /hang           -> never responds (until the caller gives up)
 //   /stall-body     -> sends 200 + headers immediately, then never sends the body
+//   /slow/{ms}      -> waits that many milliseconds, then 200
 //   anything else   -> 200 with a JSON echo of what the upstream actually received
 public sealed class FakeUpstream : IAsyncLifetime
 {
@@ -24,6 +25,14 @@ public sealed class FakeUpstream : IAsyncLifetime
     // How many requests reached the upstream. Lets tests prove the proxy really called it.
     private int _hits;
     public int Hits => Volatile.Read(ref _hits);
+
+    // How many requests are inside the upstream right now, and the most there have ever been
+    // at once. This is what proves a concurrency cap: the proxy can't fake it from its side.
+    private int _inFlight;
+    private int _peakInFlight;
+    public int PeakInFlight => Volatile.Read(ref _peakInFlight);
+    public bool InFlightIsZero => Volatile.Read(ref _inFlight) == 0;
+    public void ResetPeak() => Volatile.Write(ref _peakInFlight, Volatile.Read(ref _inFlight));
 
     public async Task InitializeAsync()
     {
@@ -36,7 +45,12 @@ public sealed class FakeUpstream : IAsyncLifetime
         _app.Use(async (ctx, next) =>
         {
             Interlocked.Increment(ref _hits);
-            await next();
+            var now = Interlocked.Increment(ref _inFlight);
+            int peak;
+            while (now > (peak = Volatile.Read(ref _peakInFlight))
+                   && Interlocked.CompareExchange(ref _peakInFlight, now, peak) != peak) { }
+            try { await next(); }
+            finally { Interlocked.Decrement(ref _inFlight); }
         });
 
         _app.MapGet("/status/{code:int}", (int code, HttpContext ctx) =>
@@ -49,6 +63,12 @@ public sealed class FakeUpstream : IAsyncLifetime
         {
             try { await Task.Delay(Timeout.Infinite, ctx.RequestAborted); }
             catch (OperationCanceledException) { }
+        });
+
+        _app.MapGet("/slow/{ms:int}", async (int ms, HttpContext ctx) =>
+        {
+            await Task.Delay(ms, ctx.RequestAborted);
+            return Results.Text($"slow {ms}");
         });
 
         // Sends status + headers straight away, then never sends the body.

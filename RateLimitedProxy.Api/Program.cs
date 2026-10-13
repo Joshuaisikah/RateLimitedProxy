@@ -3,7 +3,19 @@ using RateLimitedProxy.Api.Services;
 using Scalar.AspNetCore;
 
 var builder = WebApplication.CreateBuilder(args);
-builder.Services.Configure<UpstreamOptions>(builder.Configuration.GetSection("Upstream"));
+builder
+    .Services.AddOptions<UpstreamOptions>()
+    .Bind(builder.Configuration.GetSection(UpstreamOptions.SectionName))
+    .Validate(o => o.BaseUrl != string.Empty, "BaseUrl must be set")
+    .Validate(o => o.TimeoutMs > 0, "TimeoutMs must be greater than 0")
+    .Validate(o => o.MaxConcurrency > 0, "MaxConcurrency must be greater than 0")
+    .Validate(
+        o =>
+            Uri.TryCreate(o.BaseUrl, UriKind.Absolute, out var uri)
+            && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps),
+        "BaseUrl must be a valid HTTP or HTTPS URL"
+    )
+    .ValidateOnStart();
 builder.Services.AddHttpClient<Forwarder>(
     (sp, client) =>
     {
@@ -12,6 +24,7 @@ builder.Services.AddHttpClient<Forwarder>(
         client.Timeout = Timeout.InfiniteTimeSpan; // we handle timeouts ourselves
     }
 );
+builder.Services.AddSingleton<ConcurrencyLimiter>();
 builder.Services.AddOpenApi();
 builder.Services.AddSingleton<Metrics>();
 
@@ -28,7 +41,6 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 
-// Map controllers when present (no-op for pure minimal APIs)
 app.Map(
     "/proxy/{**path}",
     async (string? path, HttpContext ctx, Forwarder forwarder, Metrics metrics) =>
@@ -60,6 +72,11 @@ app.Map(
             }
 
             await response.Content.CopyToAsync(ctx.Response.Body, ctx.RequestAborted);
+        }
+        catch (ProxyBusyException)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            metrics.RecordRejected();
         }
         catch (UpstreamTimeoutException)
         {
