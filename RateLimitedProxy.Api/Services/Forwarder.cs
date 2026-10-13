@@ -44,7 +44,7 @@ public class Forwarder
             var response = await _httpClient.SendAsync(request, cts.Token);
             return response;
         }
-        catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             throw new UpstreamTimeoutException();
         }

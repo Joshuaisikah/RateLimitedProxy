@@ -70,6 +70,11 @@ app.Map(
         {
             // Client disconnected. Nobody to answer, and not an upstream error.
         }
+        catch (HttpRequestException) when (!ctx.Response.HasStarted)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status502BadGateway;
+            metrics.ProcessRequest(StatusCodes.Status502BadGateway);
+        }
     }
 );
 app.Run();

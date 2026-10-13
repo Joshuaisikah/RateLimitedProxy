@@ -13,6 +13,7 @@ namespace RateLimitedProxy.Tests;
 //
 //   /status/{code}  -> responds with that status, body "status {code}", header X-Upstream: fake
 //   /hang           -> never responds (until the caller gives up)
+//   /stall-body     -> sends 200 + headers immediately, then never sends the body
 //   anything else   -> 200 with a JSON echo of what the upstream actually received
 public sealed class FakeUpstream : IAsyncLifetime
 {
@@ -46,6 +47,16 @@ public sealed class FakeUpstream : IAsyncLifetime
 
         _app.Map("/hang", async (HttpContext ctx) =>
         {
+            try { await Task.Delay(Timeout.Infinite, ctx.RequestAborted); }
+            catch (OperationCanceledException) { }
+        });
+
+        // Sends status + headers straight away, then never sends the body.
+        _app.Map("/stall-body", async (HttpContext ctx) =>
+        {
+            ctx.Response.StatusCode = 200;
+            await ctx.Response.StartAsync(ctx.RequestAborted);
+            await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
             try { await Task.Delay(Timeout.Infinite, ctx.RequestAborted); }
             catch (OperationCanceledException) { }
         });
