@@ -15,6 +15,7 @@ namespace RateLimitedProxy.Tests;
 //   Upstream:TimeoutMs  - upstream timeout in milliseconds -> 504 when exceeded
 //   ANY /proxy/{**path} - the proxy endpoint
 //   Metrics             - records the FINAL status the client received
+[Collection(TestProxy.TimingSensitive)]
 public class ProxyForwardingTests : IClassFixture<FakeUpstream>, IDisposable
 {
     private const int TimeoutMs = 500;
@@ -32,8 +33,9 @@ public class ProxyForwardingTests : IClassFixture<FakeUpstream>, IDisposable
         {
             b.UseSetting("Upstream:BaseUrl", upstream.BaseUrl);
             b.UseSetting("Upstream:TimeoutMs", TimeoutMs.ToString());
+            TestProxy.AllowTestKey(b);
         });
-        _client = _proxy.CreateClient();
+        _client = TestProxy.CreateKeyedClient(_proxy);
     }
 
     public void Dispose()

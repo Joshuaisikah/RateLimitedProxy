@@ -2,7 +2,7 @@ using Microsoft.Extensions.Primitives;
 
 namespace RateLimitedProxy.Api.Services;
 
-public class HopByHopHeaders
+public class HeadersNotForwarded
 {
     private static readonly HashSet<string> Names = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -15,9 +15,10 @@ public class HopByHopHeaders
         "Trailer",
         "Transfer-Encoding",
         "Upgrade",
+        "X-Api-Key",
     };
 
-    public static bool IsHopByHop(string name) => Names.Contains(name);
+    public static bool ShouldSkip(string name) => Names.Contains(name);
 
     public static HashSet<string> NamedInConnection(
         IEnumerable<KeyValuePair<string, StringValues>> headers

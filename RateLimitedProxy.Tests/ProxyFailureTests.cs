@@ -11,6 +11,7 @@ namespace RateLimitedProxy.Tests;
 //
 //   Upstream unreachable (nothing listening) -> 502 Bad Gateway, fast, counted as an error
 //   Client gives up before the proxy answers -> nothing counted at all (the nginx 499 idea)
+[Collection(TestProxy.TimingSensitive)]
 public class ProxyFailureTests : IClassFixture<FakeUpstream>
 {
     private const int TimeoutMs = 500;
@@ -24,6 +25,7 @@ public class ProxyFailureTests : IClassFixture<FakeUpstream>
         {
             b.UseSetting("Upstream:BaseUrl", baseUrl);
             b.UseSetting("Upstream:TimeoutMs", TimeoutMs.ToString());
+            TestProxy.AllowTestKey(b);
         });
 
     // A local port that was free a moment ago and has nobody listening on it now,
@@ -43,7 +45,7 @@ public class ProxyFailureTests : IClassFixture<FakeUpstream>
     public async Task Unreachable_upstream_gives_a_fast_502()
     {
         using var proxy = ProxyFor(DeadUpstreamUrl());
-        using var client = proxy.CreateClient();
+        using var client = TestProxy.CreateKeyedClient(proxy);
 
         var clock = Stopwatch.StartNew();
         var response = await client.GetAsync("/proxy/anything");
@@ -59,7 +61,7 @@ public class ProxyFailureTests : IClassFixture<FakeUpstream>
     public async Task Unreachable_upstream_is_counted_as_an_error()
     {
         using var proxy = ProxyFor(DeadUpstreamUrl());
-        using var client = proxy.CreateClient();
+        using var client = TestProxy.CreateKeyedClient(proxy);
         var metrics = proxy.Services.GetRequiredService<Metrics>();
 
         await client.GetAsync("/proxy/anything");
@@ -73,7 +75,7 @@ public class ProxyFailureTests : IClassFixture<FakeUpstream>
     {
         // The failure must be handled per request, not poison the app.
         using var proxy = ProxyFor(DeadUpstreamUrl());
-        using var client = proxy.CreateClient();
+        using var client = TestProxy.CreateKeyedClient(proxy);
 
         var first = await client.GetAsync("/proxy/a");
         var second = await client.GetAsync("/proxy/b");
@@ -90,7 +92,7 @@ public class ProxyFailureTests : IClassFixture<FakeUpstream>
         // Deliberately says nothing about WHICH status the client gets - that is a design
         // decision still open. It only demands the proxy doesn't wait forever.
         using var proxy = ProxyFor(_upstream.BaseUrl);
-        using var client = proxy.CreateClient();
+        using var client = TestProxy.CreateKeyedClient(proxy);
         var clientPatience = TimeSpan.FromMilliseconds(TimeoutMs + 3_000);
 
         var clock = Stopwatch.StartNew();
@@ -114,7 +116,7 @@ public class ProxyFailureTests : IClassFixture<FakeUpstream>
     public async Task Client_abort_before_the_timeout_is_not_counted()
     {
         using var proxy = ProxyFor(_upstream.BaseUrl);
-        using var client = proxy.CreateClient();
+        using var client = TestProxy.CreateKeyedClient(proxy);
         var metrics = proxy.Services.GetRequiredService<Metrics>();
 
         // The client gives up well before the proxy's own upstream timeout would fire.
@@ -134,7 +136,7 @@ public class ProxyFailureTests : IClassFixture<FakeUpstream>
     public async Task Client_abort_does_not_break_the_next_request()
     {
         using var proxy = ProxyFor(_upstream.BaseUrl);
-        using var client = proxy.CreateClient();
+        using var client = TestProxy.CreateKeyedClient(proxy);
         var metrics = proxy.Services.GetRequiredService<Metrics>();
 
         using var giveUp = new CancellationTokenSource(TimeSpan.FromMilliseconds(TimeoutMs / 5));

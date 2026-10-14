@@ -5,6 +5,16 @@ public class Metrics
     private long _totalRequests;
     private long _totalErrors;
     private long _totalRejected;
+    private long _totalUnauthorized;
+    private long _totalRateLimited;
+    public long TotalRateLimited => Interlocked.Read(ref _totalRateLimited);
+
+    public void RecordRateLimited() => Interlocked.Increment(ref _totalRateLimited);
+
+    public long TotalUnauthorized => Interlocked.Read(ref _totalUnauthorized);
+
+    public void RecordUnauthorized() => Interlocked.Increment(ref _totalUnauthorized);
+
     public long TotalRejected => Interlocked.Read(ref _totalRejected);
 
     public void RecordRejected() => Interlocked.Increment(ref _totalRejected);

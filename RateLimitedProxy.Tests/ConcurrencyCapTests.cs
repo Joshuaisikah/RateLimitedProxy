@@ -16,6 +16,7 @@ namespace RateLimitedProxy.Tests;
 //                             it goes in its own counter, TotalRejected
 //
 // Each test gets its own FakeUpstream, so Hits and PeakInFlight belong to that test alone.
+[Collection(TestProxy.TimingSensitive)]
 public class ConcurrencyCapTests : IAsyncLifetime
 {
     private const int TimeoutMs = 500;
@@ -30,6 +31,7 @@ public class ConcurrencyCapTests : IAsyncLifetime
         {
             b.UseSetting("Upstream:BaseUrl", _upstream.BaseUrl);
             b.UseSetting("Upstream:TimeoutMs", TimeoutMs.ToString());
+            TestProxy.AllowTestKey(b);
             b.UseSetting("Upstream:MaxConcurrency", cap.ToString());
         });
 
@@ -58,7 +60,7 @@ public class ConcurrencyCapTests : IAsyncLifetime
     public async Task Upstream_never_sees_more_than_the_cap()
     {
         using var proxy = ProxyWithCap(2);
-        using var client = proxy.CreateClient();
+        using var client = TestProxy.CreateKeyedClient(proxy);
 
         // 10 requests, 50 ms each, 2 at a time = ~250 ms, well inside the 500 ms budget.
         var statuses = await FireAtOnce(client, 10, "/proxy/slow/50");
@@ -73,7 +75,7 @@ public class ConcurrencyCapTests : IAsyncLifetime
     {
         // Guards against a "fix" that serialises everything (cap of 1 no matter the setting).
         using var proxy = ProxyWithCap(3);
-        using var client = proxy.CreateClient();
+        using var client = TestProxy.CreateKeyedClient(proxy);
 
         await FireAtOnce(client, 9, "/proxy/slow/100");
 
@@ -86,7 +88,7 @@ public class ConcurrencyCapTests : IAsyncLifetime
     public async Task Requests_that_never_get_a_slot_get_503_and_never_reach_the_upstream()
     {
         using var proxy = ProxyWithCap(1);
-        using var client = proxy.CreateClient();
+        using var client = TestProxy.CreateKeyedClient(proxy);
 
         var statuses = await Overload(client);
 
@@ -110,7 +112,7 @@ public class ConcurrencyCapTests : IAsyncLifetime
     public async Task A_cap_503_is_counted_as_rejected_not_as_an_error_or_a_request()
     {
         using var proxy = ProxyWithCap(1);
-        using var client = proxy.CreateClient();
+        using var client = TestProxy.CreateKeyedClient(proxy);
         var metrics = proxy.Services.GetRequiredService<Metrics>();
 
         var statuses = await Overload(client);
@@ -130,7 +132,7 @@ public class ConcurrencyCapTests : IAsyncLifetime
         // "Bounded wait until the TimeoutMs deadline" - rejecting instantly would be a
         // different design (fail-fast), not the one agreed.
         using var proxy = ProxyWithCap(1);
-        using var client = proxy.CreateClient();
+        using var client = TestProxy.CreateKeyedClient(proxy);
 
         var holder = client.GetAsync("/proxy/hang");
         await WaitUntil(() => _upstream.Hits == 1);
@@ -155,7 +157,7 @@ public class ConcurrencyCapTests : IAsyncLifetime
         // The WaitAsync-returned-false door: if a rejected request still calls Release(),
         // every 503 above permanently adds one slot.
         using var proxy = ProxyWithCap(1);
-        using var client = proxy.CreateClient();
+        using var client = TestProxy.CreateKeyedClient(proxy);
 
         var first = await Overload(client);
         Assert.Contains(HttpStatusCode.ServiceUnavailable, first);
@@ -176,7 +178,7 @@ public class ConcurrencyCapTests : IAsyncLifetime
     {
         // The exception door: a client gives up while queued for a slot.
         using var proxy = ProxyWithCap(1);
-        using var client = proxy.CreateClient();
+        using var client = TestProxy.CreateKeyedClient(proxy);
 
         var holder = client.GetAsync("/proxy/hang");
         await WaitUntil(() => _upstream.Hits == 1);

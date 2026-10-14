@@ -47,10 +47,10 @@ public class Forwarder
             {
                 request.Content = new StreamContent(body);
             }
-            var skip = HopByHopHeaders.NamedInConnection(headers);
+            var skip = HeadersNotForwarded.NamedInConnection(headers);
             foreach (var (name, value) in headers)
             {
-                if (HopByHopHeaders.IsHopByHop(name) || skip.Contains(name))
+                if (HeadersNotForwarded.ShouldSkip(name) || skip.Contains(name))
                     continue;
                 if (!request.Headers.TryAddWithoutValidation(name, value.ToArray()))
                     request.Content?.Headers.TryAddWithoutValidation(name, value.ToArray());

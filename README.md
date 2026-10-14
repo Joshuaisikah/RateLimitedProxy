@@ -11,23 +11,29 @@ Project 07 of the .NET ladder (see `~/dotnet/PROJECTS.md`).
 | 2 | Metrics counters (`Interlocked`, exact under concurrency) | ✅ |
 | 3 | Forwarding + timeout | ✅ 55/55 tests |
 | 4 | Global cap on concurrent upstream calls (`SemaphoreSlim`) | ✅ 62/62 tests |
-| 5 | Per-API-key token bucket → `429` + `Retry-After` | next |
-| 6 | Circuit breaker (5 failures → fail fast 30 s → half-open) | |
+| 5 | Per-API-key token bucket → `429` + `Retry-After` | ✅ 98/98 tests |
+| 6 | Circuit breaker (5 failures → fail fast 30 s → half-open) | next |
 | 7 | p50 / p95 latency on the metrics endpoint | |
 
 ## Contract
 
 | Setting / route | Meaning |
 |---|---|
-| `Upstream:BaseUrl` | Where requests are forwarded to |
+| `Upstream:BaseUrl` | Where requests are forwarded to. If it has a path, the path must end in `/` (e.g. `https://host/v1/`), or the proxy won't start |
 | `Upstream:TimeoutMs` | Deadline for the whole request, **including the wait for a slot** |
 | `Upstream:MaxConcurrency` | Most requests inside the upstream at once (default `20`) |
+| `RateLimit:ApiKeys` | The API keys allowed to use the proxy. Required: no default, no blanks, no duplicates. Case-sensitive |
+| `RateLimit:Capacity` | Burst size, and the most tokens a bucket can hold (default `10`, at least `1`) |
+| `RateLimit:RefillPerSecond` | Tokens added back per second, fractions kept (default `1.0`, finite and > 0) |
+| `X-Api-Key` header | The client's key. Header name is case-insensitive, the value is not. Never forwarded upstream |
 | `ANY /proxy/{**path}` | Forwards method, path, query, headers and body to the upstream |
 
 ## What the client gets back
 
 | Situation | Client sees | Counted in metrics? |
 |---|---|---|
+| No `X-Api-Key`, or a key not in the list | `401 Unauthorized` + `WWW-Authenticate: ApiKey realm="RateLimitedProxy"`, upstream never called | Only in `TotalUnauthorized` |
+| Key's bucket is empty | `429 Too Many Requests` + `Retry-After: <seconds>`, upstream never called | Only in `TotalRateLimited` |
 | Upstream answers (any status) | That status, body and headers, unchanged | Yes, as that status |
 | No slot free before the deadline | `503 Service Unavailable`, upstream never called | Only in `TotalRejected`, not a request, not an error |
 | Upstream doesn't finish within `TimeoutMs` | `504 Gateway Timeout` | Yes, as an error |
@@ -45,7 +51,10 @@ asking whose token fired: the proxy's own deadline, or `HttpContext.RequestAbort
   hosting on the upstream breaks (wrong site or `421 Misdirected Request`).
 - Hop-by-hop headers (RFC 9110 §7.6.1) are dropped in both directions, including any header
   named inside `Connection`. `Proxy-Authorization` is a credential for this proxy, not for
-  the upstream.
+  the upstream. The same goes for `X-Api-Key`: forwarding it would put every client's key in
+  the upstream's logs.
+- The set is called `HeadersNotForwarded`, not `HopByHopHeaders`: `Host` and `X-Api-Key`
+  aren't hop-by-hop. The name says *why* they're skipped, not which RFC category they're in.
 - `Content-Type` and the other body headers describe the body, so in .NET they live on the
   content, not on the request.
 
@@ -131,6 +140,75 @@ tE      slot released (body is already in proxy memory, thanks to buffering)
   is created the first time something asks for it, so without startup validation a
   `MaxConcurrency` of `0` started fine and then served `500` to every request.
 
+### Rate limiting per API key (M5)
+
+Every key gets its own **token bucket**. A request costs one token. The bucket holds at most
+`Capacity` tokens (the burst size) and refills at `RefillPerSecond` (the long-run rate).
+A bucket starts full, so a new client can burst straight away.
+
+```
+request ──▶ key check ──▶ rate check ──▶ concurrency slot ──▶ upstream
+             │ unknown       │ empty         │ no slot by deadline
+             ▼               ▼               ▼
+            401             429             503
+```
+
+- **Refill, check and take are one atomic step.** Checking for a token and then taking it in
+  two steps is *check-then-act* (TOCTOU): two requests both see the last token and both take
+  it. The bucket holds a `lock` around the whole step. It reads the time, adds the tokens
+  earned since the last call, then takes one. Guarded by
+  `Concurrent_requests_on_one_key_never_spend_more_than_capacity` (20 keys × 40 requests at
+  once, exactly 5 get through per key).
+- **One lock per bucket, on the bucket's own object.** `alice` and `bob` never wait for each
+  other. The lock is never on the key string: `lock` compares *references*, and two `"alice"`
+  strings read from two requests' headers are two different objects. (*Reference vs value
+  equality*, *string interning*.)
+- **Buckets are created at startup, from the key list.** The dictionary is only read after
+  that, so a plain `Dictionary` is safe for concurrent reads and there's no `GetOrAdd`
+  race when two first-ever requests for a key arrive together. The cost: adding a key needs a
+  restart.
+- **One lookup answers both questions.** `RateLimiter.Check` returns `UnknownKey`, `Limited`
+  or `Allowed`. A separate "is this key known?" list was removed, because two lists can
+  disagree, and the endpoint used `?? ""` to quiet the compiler about a null it couldn't
+  rule out. The null/blank check runs before `TryGetValue`, which throws on a null key.
+- **Only a configured key gets a bucket.** If any string got its own bucket, a client on a
+  `429` could just send another made-up key (*key rotation*), and the dictionary would grow
+  with every one.
+- **Fractions are kept.** Tokens are a `double`. At 1 token per 4 s, asking every 1.5 s gives
+  0.375 → 0.75 → 1.125, so the third request passes. A refill that rounded down to whole
+  tokens and reset its clock would never pass. Guarded by `Refill_keeps_the_fraction`.
+- **Time comes from an injected `TimeProvider`,** read with `GetTimestamp` /
+  `GetElapsedTime`. That's a monotonic clock, so an NTP correction to the wall clock can't
+  make elapsed time go negative or jump forward. The tests swap in `FakeTimeProvider`, so time
+  only moves when a test moves it. (The upstream timeout still runs on real time.)
+- **`Retry-After` = seconds until the next whole token, rounded up.** At 1 token per 4 s
+  with 0.625 tokens, the next token is 1.5 s away, so the header says `2`. Rounding down
+  would say `1`, and a client that obeys it gets another `429`. The trade-off was chosen
+  deliberately: a header up to a second too long is better than a client retrying too early.
+  There's no rounding *before* the ceiling, because that would bring the too-early error back.
+- **The rate check runs before the concurrency slot.** An over-limit client gets its `429`
+  straight away and never takes a place in the slot queue from clients within their limit.
+- **A token pays for the attempt.** A request that passes the rate check and then gets a cap
+  `503` has still spent its token. Refunding would be fairer, but it's a second write to the
+  bucket from somewhere else, and it could push the bucket over capacity.
+- **Rejections aren't upstream errors.** `401`s and `429`s have their own counters
+  (`TotalUnauthorized`, `TotalRateLimited`), stay out of `TotalRequests`, and must never feed
+  the circuit breaker (M6). On a dashboard, `TotalRejected` means "the proxy is full" and
+  `TotalRateLimited` means "a client is over its limit". Those lead to different actions.
+- **Unknown outcomes fail closed.** The endpoint's `switch` handles `Allowed` explicitly and
+  throws on anything else, so a future outcome can never fall through to the upstream.
+- **Keys aren't in the repo.** In development they come from user secrets. The tests run in a
+  `Testing` environment so those keys can't merge into the test config (config arrays merge
+  *by index*).
+
+### Base URL with a path
+
+RFC 3986 §5.2.3: when a relative path is resolved against a base URL, the base path's last
+segment is dropped. `https://host/v1` + `users/5` → `https://host/users/5`, so `v1` is lost
+without any error. The proxy refuses to start if the base URL has a path that doesn't end in
+`/`. It checks `Uri.AbsolutePath`, not the raw string, so a host-only URL (path `/`) is fine
+with or without the slash.
+
 ## Open questions
 
 - **What exactly do the metrics count?** What the upstream answered, what the proxy
@@ -138,8 +216,6 @@ tE      slot released (body is already in proxy memory, thanks to buffering)
   before the body is copied to the client. If the client disconnects mid-copy, the metric
   still says `200`. Whether that's a bug depends on the definition.
 - A `GET` with `Content-Type` but no body: the header is silently dropped. Is that fine?
-- An honest name for the set of stripped headers that includes `Host`, which isn't strictly
-  hop-by-hop.
 - **What protects the proxy?** The cap protects the upstream, not the proxy. Once a body is
   buffered the slot is freed, but the body stays in memory until the client has read it.
   Take 500 slow clients each downloading 50 MB: none of them holds a slot, the proxy holds
@@ -151,6 +227,16 @@ tE      slot released (body is already in proxy memory, thanks to buffering)
   ms left and then times out as a `504`, which counts as an error. When the upstream is
   slow, queueing makes the error count higher than the upstream's real failure rate. Should
   those `504`s feed the circuit breaker?
+
+- **Keys need a restart.** Buckets are built once at startup. Picking up new keys without a
+  restart means rebuilding the dictionary safely while requests are reading it
+  (`IOptionsMonitor`, swap in a new immutable dictionary). Would `FrozenDictionary` say
+  "read-only after startup" more clearly than `Dictionary`?
+- **Two `X-Api-Key` headers.** The first value is used. Should more than one key in a single
+  request be a `401`?
+- **Should `429`s refund nothing, ever?** Token = attempt was chosen for simplicity. Fairer
+  alternatives (refund on `503`) need the refund to be atomic with refill and capped at
+  `Capacity`.
 
 ## Running
 
