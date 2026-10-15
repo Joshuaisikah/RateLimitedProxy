@@ -24,7 +24,14 @@ public static class TestProxy
         b.UseSetting("RateLimit:ApiKeys:0", Key);
         b.UseSetting("RateLimit:Capacity", "1000000");
         b.UseSetting("RateLimit:RefillPerSecond", "1000000");
+        NeverTripBreaker(b);
     }
+
+    // Milestone 6 added a circuit breaker. The older tests deliberately produce strings of
+    // 5xx/504/502 and must not have the breaker start answering for the upstream.
+    // CircuitBreakerTests override this with their own threshold.
+    public static void NeverTripBreaker(IWebHostBuilder b) =>
+        b.UseSetting("CircuitBreaker:FailureThreshold", "1000000");
 
     public static HttpClient CreateKeyedClient(WebApplicationFactory<Program> proxy)
     {

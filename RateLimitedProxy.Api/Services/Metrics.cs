@@ -7,6 +7,11 @@ public class Metrics
     private long _totalRejected;
     private long _totalUnauthorized;
     private long _totalRateLimited;
+    private long _totalCircuitOpen;
+    public long TotalCircuitOpen => Interlocked.Read(ref _totalCircuitOpen);
+
+    public void RecordCircuitOpen() => Interlocked.Increment(ref _totalCircuitOpen);
+
     public long TotalRateLimited => Interlocked.Read(ref _totalRateLimited);
 
     public void RecordRateLimited() => Interlocked.Increment(ref _totalRateLimited);

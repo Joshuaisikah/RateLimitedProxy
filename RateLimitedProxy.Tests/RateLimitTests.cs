@@ -72,6 +72,7 @@ public class RateLimitTests : IAsyncLifetime
                         System.Globalization.CultureInfo.InvariantCulture
                     )
                 );
+            TestProxy.NeverTripBreaker(b);
             b.ConfigureTestServices(s => s.AddSingleton<TimeProvider>(_time));
         });
 

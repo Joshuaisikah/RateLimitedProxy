@@ -47,6 +47,16 @@ builder
         "RateLimit:ApiKeys must not contain duplicates"
     )
     .ValidateOnStart();
+builder
+    .Services.AddOptions<CircuitBreakerOptions>()
+    .Bind(builder.Configuration.GetSection(CircuitBreakerOptions.SectionName))
+    .Validate(o => o.FailureThreshold >= 1, "CircuitBreaker:FailureThreshold must be at least 1")
+    .Validate(
+        o => o.BreakDurationSeconds >= 1,
+        "CircuitBreaker:BreakDurationSeconds must be at least 1"
+    )
+    .ValidateOnStart();
+builder.Services.AddSingleton<CircuitBreaker>();
 builder.Services.AddSingleton<TimeProvider>(TimeProvider.System);
 builder.Services.AddSingleton<RateLimiter>();
 builder.Services.AddSingleton<ConcurrencyLimiter>();
@@ -65,7 +75,6 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
-
 app.Map(
     "/proxy/{**path}",
     async (
@@ -73,7 +82,8 @@ app.Map(
         HttpContext ctx,
         Forwarder forwarder,
         Metrics metrics,
-        RateLimiter limiter
+        RateLimiter limiter,
+        CircuitBreaker breaker // new
     ) =>
     {
         var apikey = ctx.Request.Headers["X-Api-Key"].FirstOrDefault();
@@ -99,6 +109,20 @@ app.Map(
                     $"Unexpected rate limit outcome: {rate.Outcome}"
                 );
         }
+
+        // new: may this request go through? (auth -> rate -> breaker -> slot)
+        var admission = breaker.Admit();
+        if (admission.Outcome == AdmitOutCome.Rejected)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            ctx.Response.Headers["X-Proxy-Reason"] = "circuit-open";
+            ctx.Response.Headers["Retry-After"] = admission.RetryAfterSeconds.ToString();
+            metrics.RecordCircuitOpen();
+            return;
+        }
+        var isTrial = admission.Outcome == AdmitOutCome.Trial;
+        var reported = false;
+
         try
         {
             var hasBody =
@@ -118,6 +142,14 @@ app.Map(
             ctx.Response.StatusCode = status;
             metrics.ProcessRequest(status);
 
+            // new: report the upstream's answer BEFORE copying the body,
+            // so a client hanging up during the copy can't make it neutral
+            if (status >= 500)
+                breaker.RecordFailure(isTrial);
+            else
+                breaker.RecordSuccess(isTrial);
+            reported = true;
+
             foreach (var header in response.Headers.Concat(response.Content.Headers))
             {
                 if (HeadersNotForwarded.ShouldSkip(header.Key))
@@ -131,20 +163,30 @@ app.Map(
         {
             ctx.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
             metrics.RecordRejected();
+            // neutral: the finally releases a trial claim
         }
         catch (UpstreamTimeoutException)
         {
             ctx.Response.StatusCode = StatusCodes.Status504GatewayTimeout;
             metrics.ProcessRequest(StatusCodes.Status504GatewayTimeout);
+            breaker.RecordFailure(isTrial); // new
+            reported = true; // new
         }
         catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested)
         {
-            // Client disconnected. Nobody to answer, and not an upstream error.
+            // Client disconnected. Neutral: the finally releases a trial claim.
         }
         catch (HttpRequestException) when (!ctx.Response.HasStarted)
         {
             ctx.Response.StatusCode = StatusCodes.Status502BadGateway;
             metrics.ProcessRequest(StatusCodes.Status502BadGateway);
+            breaker.RecordFailure(isTrial); // new
+            reported = true; // new
+        }
+        finally // new
+        {
+            if (!reported)
+                breaker.RecordNeutral(isTrial);
         }
     }
 );

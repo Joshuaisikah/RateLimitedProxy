@@ -12,8 +12,8 @@ Project 07 of the .NET ladder (see `~/dotnet/PROJECTS.md`).
 | 3 | Forwarding + timeout | ✅ 55/55 tests |
 | 4 | Global cap on concurrent upstream calls (`SemaphoreSlim`) | ✅ 62/62 tests |
 | 5 | Per-API-key token bucket → `429` + `Retry-After` | ✅ 98/98 tests |
-| 6 | Circuit breaker (5 failures → fail fast 30 s → half-open) | next |
-| 7 | p50 / p95 latency on the metrics endpoint | |
+| 6 | Circuit breaker (5 failures → fail fast 30 s → half-open) | ✅ 136/136 tests |
+| 7 | p50 / p95 latency on the metrics endpoint | next |
 
 ## Contract
 
@@ -25,6 +25,8 @@ Project 07 of the .NET ladder (see `~/dotnet/PROJECTS.md`).
 | `RateLimit:ApiKeys` | The API keys allowed to use the proxy. Required: no default, no blanks, no duplicates. Case-sensitive |
 | `RateLimit:Capacity` | Burst size, and the most tokens a bucket can hold (default `10`, at least `1`) |
 | `RateLimit:RefillPerSecond` | Tokens added back per second, fractions kept (default `1.0`, finite and > 0) |
+| `CircuitBreaker:FailureThreshold` | Consecutive upstream failures that open the circuit (default `5`, at least `1`) |
+| `CircuitBreaker:BreakDurationSeconds` | How long an open circuit fails fast before letting one trial through (default `30`, at least `1`) |
 | `X-Api-Key` header | The client's key. Header name is case-insensitive, the value is not. Never forwarded upstream |
 | `ANY /proxy/{**path}` | Forwards method, path, query, headers and body to the upstream |
 
@@ -34,6 +36,7 @@ Project 07 of the .NET ladder (see `~/dotnet/PROJECTS.md`).
 |---|---|---|
 | No `X-Api-Key`, or a key not in the list | `401 Unauthorized` + `WWW-Authenticate: ApiKey realm="RateLimitedProxy"`, upstream never called | Only in `TotalUnauthorized` |
 | Key's bucket is empty | `429 Too Many Requests` + `Retry-After: <seconds>`, upstream never called | Only in `TotalRateLimited` |
+| Circuit open, or half-open with the trial already in flight | `503 Service Unavailable` + `X-Proxy-Reason: circuit-open` + `Retry-After`, upstream never called | Only in `TotalCircuitOpen` |
 | Upstream answers (any status) | That status, body and headers, unchanged | Yes, as that status |
 | No slot free before the deadline | `503 Service Unavailable`, upstream never called | Only in `TotalRejected`, not a request, not an error |
 | Upstream doesn't finish within `TimeoutMs` | `504 Gateway Timeout` | Yes, as an error |
@@ -201,6 +204,75 @@ request ──▶ key check ──▶ rate check ──▶ concurrency slot ─�
   `Testing` environment so those keys can't merge into the test config (config arrays merge
   *by index*).
 
+### Circuit breaker (M6)
+
+When the upstream keeps failing, stop sending it traffic for a while instead of making every
+client wait for a timeout. One breaker for the whole proxy: it protects the upstream, and a
+per-key breaker would let a dead upstream be hit once per key.
+
+```
+request ──▶ key check ──▶ rate check ──▶ breaker ──▶ concurrency slot ──▶ upstream
+             │ unknown       │ empty       │ open /      │ no slot by deadline
+             ▼               ▼             ▼ trial busy  ▼
+            401             429           503 +        503
+                                          X-Proxy-Reason: circuit-open
+```
+
+```
+            5 consecutive failures
+  CLOSED ───────────────────────────▶ OPEN ◀──────────────┐
+    ▲                                  │                  │ trial fails
+    │                                  │ a request arrives│ (opened-at = now)
+    │ trial succeeds                   │ ≥ 30 s later     │
+    │                                  ▼                  │
+    └──────────────────────────────  HALF-OPEN ───────────┘
+                                 one trial goes upstream,
+                                 everyone else gets the open-circuit 503
+```
+
+- **Transitions are lazy.** Nothing fires at the 30-second mark. The first request after it
+  checks the clock and moves the state on, the same way the token bucket refills when asked.
+  No timer, no background thread. Time comes from the injected `TimeProvider`, so the tests
+  can jump 30 s in one call.
+- **What counts as a failure:** the upstream answered any `5xx`, the proxy's `504`
+  (including a request that waited for a slot and then ran out of time), and the proxy's
+  `502` (unreachable). Anything else the upstream answers, `4xx` included, is a **success**,
+  because the upstream is alive and answering. A success resets the count, so
+  F F F F S F is one consecutive failure, not five.
+- **What doesn't count, and doesn't reset either:** client aborts, `401`, `429`, cap `503`.
+  None of these says anything about the upstream's health.
+- **One `lock` around every state change**: `Admit`, `RecordSuccess`, `RecordFailure`,
+  `RecordNeutral`. Without it, "is it open? / has 30 s passed? / claim the trial" is
+  check-then-act (TOCTOU): 15 requests arriving at t = 30.001 would all see "open, 30 s
+  passed" and all become the trial. The lock is **never held during the upstream call**,
+  so a hanging trial can't make other requests wait just to be told "rejected". Guarded by
+  `Exactly_one_trial_when_15_arrive_at_once`.
+- **Every admitted request reports exactly once.** A `reported` flag is set when an outcome
+  is recorded, and a `finally` reports *neutral* if nothing else did. That handles the trial
+  that never gets a verdict: its client aborts, or it loses the slot race and gets a cap
+  `503`. Without that, the trial's claim would never be released and the breaker would stay
+  half-open forever, rejecting everything. Guarded by
+  `A_trial_whose_client_aborts_releases_the_claim`.
+- **The outcome is recorded before the body is copied.** By then the upstream has answered.
+  A client hanging up during the copy can't turn a real answer into "neutral".
+- **Only the trial moves the circuit out of half-open.** Requests admitted while closed can
+  come back late, after the circuit has opened. Their results are ignored unless the
+  circuit is closed. Otherwise a slow success from before the outage could close it, or a
+  burst of late failures could reopen it and push the cooldown back. Guarded by
+  `A_late_success_while_open_is_ignored` and
+  `Late_failures_while_open_do_not_restart_the_cooldown`.
+- **A failed trial restarts the cooldown from the trial**, not from the first opening.
+- **The breaker check runs after the key and rate checks.** An unknown key gets `401` even
+  while the circuit is open, so strangers learn nothing about the upstream's health. A
+  circuit-rejected request has spent its token: *token = attempt*, the same rule as for
+  the cap `503`.
+- **The two `503`s can be told apart.** A circuit `503` carries
+  `X-Proxy-Reason: circuit-open` and is counted in `TotalCircuitOpen`. A cap `503` has
+  neither. "Proxy full" and "upstream dead" lead to different fixes.
+- **`Retry-After`.** When open, it's the seconds left until half-open, rounded up and never
+  `0` (same reasoning as M5). When half-open it's `1`, because the trial resolves within
+  `TimeoutMs`.
+
 ### Base URL with a path
 
 RFC 3986 §5.2.3: when a relative path is resolved against a base URL, the base path's last
@@ -222,11 +294,20 @@ with or without the slash.
   about 25 GB, and nothing limits it. Options to look at: a response size limit
   (`HttpClient.MaxResponseContentBufferSize`), a separate cap on requests in the proxy as a
   whole, or a client-side timeout for the copy.
-- **Waiters turn into `504`s (M6).** With a shared deadline, a single waiter rarely gets a
-  `503`. A slot usually frees up just before its deadline, so it gets the slot with a few
-  ms left and then times out as a `504`, which counts as an error. When the upstream is
-  slow, queueing makes the error count higher than the upstream's real failure rate. Should
-  those `504`s feed the circuit breaker?
+- **Queue-induced `504`s feed the breaker (decided in M6, worth revisiting).** With a shared
+  deadline, a waiter often gets a slot with a few ms left and then times out as a `504`.
+  M6 counts those as failures because the breaker can't tell why a request was slow. The
+  cost: under load, a healthy but slow upstream plus a long queue can trip the circuit.
+  A fix would give the upstream call its own minimum budget, or skip the call when too
+  little time is left.
+- **Half-open `Retry-After: 1` vs a 5 s trial.** The trial can take up to `TimeoutMs`
+  (5 s by default). A client that obeys `1` may be rejected again several times. Would
+  `ceil(TimeoutMs / 1000)` be more honest?
+- **One trial means slow recovery.** After an outage, a single success closes the circuit
+  and the full load returns at once. Gradual ramp-up (several trials, or a percentage of
+  traffic) is how bigger systems avoid knocking a just-recovered upstream over again.
+- **`X-Proxy-Reason` is a made-up header.** RFC 9457 *problem details*
+  (`application/problem+json` with a `type`) would be the standard way to say why.
 
 - **Keys need a restart.** Buckets are built once at startup. Picking up new keys without a
   restart means rebuilding the dictionary safely while requests are reading it
