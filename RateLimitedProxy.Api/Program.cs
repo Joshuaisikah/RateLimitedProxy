@@ -62,7 +62,7 @@ builder.Services.AddSingleton<RateLimiter>();
 builder.Services.AddSingleton<ConcurrencyLimiter>();
 builder.Services.AddOpenApi();
 builder.Services.AddSingleton<Metrics>();
-
+builder.Services.AddSingleton<LatencyHistogram>();
 builder.Services.AddControllers();
 
 var app = builder.Build();
@@ -83,9 +83,12 @@ app.Map(
         Forwarder forwarder,
         Metrics metrics,
         RateLimiter limiter,
-        CircuitBreaker breaker // new
+        CircuitBreaker breaker,
+        LatencyHistogram latency,
+        TimeProvider time
     ) =>
     {
+        var started = time.GetTimestamp();
         var apikey = ctx.Request.Headers["X-Api-Key"].FirstOrDefault();
 
         var rate = limiter.Check(apikey);
@@ -110,7 +113,7 @@ app.Map(
                 );
         }
 
-        // new: may this request go through? (auth -> rate -> breaker -> slot)
+        // May this request go through? (auth -> rate -> breaker -> slot)
         var admission = breaker.Admit();
         if (admission.Outcome == AdmitOutCome.Rejected)
         {
@@ -122,6 +125,7 @@ app.Map(
         }
         var isTrial = admission.Outcome == AdmitOutCome.Trial;
         var reported = false;
+        var aborted = false;
 
         try
         {
@@ -142,8 +146,8 @@ app.Map(
             ctx.Response.StatusCode = status;
             metrics.ProcessRequest(status);
 
-            // new: report the upstream's answer BEFORE copying the body,
-            // so a client hanging up during the copy can't make it neutral
+            // Report the upstream's answer BEFORE copying the body, so a client
+            // hanging up during the copy can't turn it into a neutral outcome.
             if (status >= 500)
                 breaker.RecordFailure(isTrial);
             else
@@ -163,31 +167,60 @@ app.Map(
         {
             ctx.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
             metrics.RecordRejected();
-            // neutral: the finally releases a trial claim
+            // Neutral: the finally releases a trial claim.
         }
         catch (UpstreamTimeoutException)
         {
             ctx.Response.StatusCode = StatusCodes.Status504GatewayTimeout;
             metrics.ProcessRequest(StatusCodes.Status504GatewayTimeout);
-            breaker.RecordFailure(isTrial); // new
-            reported = true; // new
+            breaker.RecordFailure(isTrial);
+            reported = true;
         }
         catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested)
         {
-            // Client disconnected. Neutral: the finally releases a trial claim.
+            // Client disconnected. Neutral, and not sampled.
+            aborted = true;
         }
         catch (HttpRequestException) when (!ctx.Response.HasStarted)
         {
             ctx.Response.StatusCode = StatusCodes.Status502BadGateway;
             metrics.ProcessRequest(StatusCodes.Status502BadGateway);
-            breaker.RecordFailure(isTrial); // new
-            reported = true; // new
+            breaker.RecordFailure(isTrial);
+            reported = true;
         }
-        finally // new
+        finally
         {
             if (!reported)
                 breaker.RecordNeutral(isTrial);
+            if (!aborted)
+                latency.Record(time.GetElapsedTime(started));
         }
+    }
+);
+app.MapGet(
+    "/metrics",
+    (Metrics m, LatencyHistogram h) =>
+    {
+        var s = h.Snapshot();
+        var errors = m.TotalErrors;
+        var requests = m.TotalRequests;
+        var rate = requests == 0 ? (double?)null : (double)errors / requests;
+        return Results.Json(
+            new
+            {
+                totalRequests = requests,
+                totalErrors = errors,
+                totalRejected = m.TotalRejected,
+                totalRateLimited = m.TotalRateLimited,
+                totalUnauthorized = m.TotalUnauthorized,
+                totalCircuitOpen = m.TotalCircuitOpen,
+                errorRate = rate,
+                sampleCount = s.Count,
+                p50Ms = s.P50,
+                p95Ms = s.P95,
+                overflowCount = s.OverflowCount,
+            }
+        );
     }
 );
 app.Run();

@@ -13,7 +13,7 @@ Project 07 of the .NET ladder (see `~/dotnet/PROJECTS.md`).
 | 4 | Global cap on concurrent upstream calls (`SemaphoreSlim`) | ✅ 62/62 tests |
 | 5 | Per-API-key token bucket → `429` + `Retry-After` | ✅ 98/98 tests |
 | 6 | Circuit breaker (5 failures → fail fast 30 s → half-open) | ✅ 136/136 tests |
-| 7 | p50 / p95 latency on the metrics endpoint | next |
+| 7 | p50 / p95 latency on the metrics endpoint | ✅ 182/182 tests |
 
 ## Contract
 
@@ -29,6 +29,7 @@ Project 07 of the .NET ladder (see `~/dotnet/PROJECTS.md`).
 | `CircuitBreaker:BreakDurationSeconds` | How long an open circuit fails fast before letting one trial through (default `30`, at least `1`) |
 | `X-Api-Key` header | The client's key. Header name is case-insensitive, the value is not. Never forwarded upstream |
 | `ANY /proxy/{**path}` | Forwards method, path, query, headers and body to the upstream |
+| `GET /metrics` | Counters, error rate and p50/p95 latency as JSON. No key, no token, never forwarded, never counts itself |
 
 ## What the client gets back
 
@@ -273,6 +274,61 @@ request ──▶ key check ──▶ rate check ──▶ breaker ──▶ con
   `0` (same reasoning as M5). When half-open it's `1`, because the trial resolves within
   `TimeoutMs`.
 
+### Latency percentiles and `/metrics` (M7)
+
+```json
+{
+  "totalRequests": 4, "totalErrors": 1, "errorRate": 0.25,
+  "totalRejected": 0, "totalRateLimited": 0, "totalUnauthorized": 0, "totalCircuitOpen": 0,
+  "sampleCount": 4, "p50Ms": 50, "p95Ms": 100, "overflowCount": 0
+}
+```
+
+- **What latency means:** from the request arriving at the proxy to the response being
+  decided, read from the injected `TimeProvider`. That's what the client experiences,
+  slot wait included.
+- **Which requests are sampled:** every *admitted* request (one that passed the key, rate and
+  breaker checks) except client aborts. Upstream answers of any status, `504`s (about
+  `TimeoutMs`), `502`s and cap `503`s are all sampled. A request that crashed with an
+  unhandled exception is still sampled: it was admitted and the client didn't leave.
+  `401`, `429` and circuit `503`s are not sampled. Those take about 0 ms and would drag p50
+  towards zero during an outage, so the number would say "faster" at the worst moment.
+  Skipping cap `503`s and queue `504`s would do the opposite: they hide exactly the
+  requests that show the proxy is overloaded.
+- **`sampleCount` ≠ `totalRequests`.** Cap `503`s are sampled but, since M4, are not in
+  `totalRequests`.
+- **Storage: fixed buckets since startup.** Upper edges in ms, inclusive (≤): 1, 2, 5, 10,
+  25, 50, 100, 250, 500, 1000, 2500, 5000, plus an overflow bucket. Memory stays constant
+  however many requests arrive, and recording is one `Interlocked.Increment`. The cost is
+  that the exact value is lost: only the bucket is known.
+- **Percentile = nearest rank, reported as the bucket's upper edge.** rank = ⌈p × N⌉
+  (`(pct * n + 99) / 100` in integers). Walk the buckets from the fastest, keeping a running
+  total, and stop at the first bucket whose total reaches the rank. Reporting the upper edge
+  never under-reports, the same choice as rounding `Retry-After` up. With samples
+  5, 10, …, 100 ms, p95 is rank 19 = 95 ms, reported as `100`.
+- **Exponential edges.** 3 ms vs 13 ms matters, 4003 ms vs 4013 ms doesn't, so the buckets
+  are narrow where latencies are small and wide where they're big.
+- **No data vs too slow.** With 0 samples both percentiles are `null` (rank ⌈p × 0⌉ = 0
+  would otherwise "find" the first bucket and report 1 ms with no data at all). When the
+  rank lands in the overflow bucket, that percentile is also `null`. `sampleCount` and
+  `overflowCount` tell the two apart.
+- **`errorRate` = `totalErrors` ÷ `totalRequests`, `null` at 0 requests.** Rejections don't
+  dilute it. `0` would claim "no errors" for a proxy that has proven nothing.
+- **Reading while requests record: two different torn reads.**
+  - *Buckets*: the snapshot copies each bucket one at a time, so it matches no exact instant
+    (it's *torn*). That's harmless, because N is computed **from the copy**. The walk is
+    consistent with the data it walks and always reaches the rank; the worst case is being
+    a few microseconds stale. If N came from a separate counter, the walk could run off the
+    end.
+  - *Counters*: `ProcessRequest` increments requests **before** errors. Reading requests
+    and *then* errors lets requests land between the two reads, so the response could say
+    3 errors out of 1 request (300%). The endpoint reads **errors first, then requests**,
+    once each into locals, and prints those same locals, so errors ≤ requests always holds
+    within one response. Tests can't catch this (the gap is nanoseconds); it was found by
+    walking a timeline.
+- **`/metrics` is outside `/proxy`.** It never reaches the proxy handler, so it's never
+  forwarded, never rate limited, and never counts itself.
+
 ### Base URL with a path
 
 RFC 3986 §5.2.3: when a relative path is resolved against a base URL, the base path's last
@@ -318,6 +374,17 @@ with or without the slash.
 - **Should `429`s refund nothing, ever?** Token = attempt was chosen for simplicity. Fairer
   alternatives (refund on `503`) need the refund to be atomic with refill and capped at
   `Capacity`.
+
+- **`/metrics` is public on the proxy's only port.** Anyone who can reach the proxy can see
+  traffic volume and error rate, and could time an attack for when errors spike. The usual
+  fix is a separate *management port* (Kestrel listening on two ports, the endpoint
+  restricted with `RequireHost("*:port")`).
+- **Since startup, not a window.** After a day of traffic, a 5-minute incident barely moves
+  p95. Options: reset on scrape, a ring of per-minute histograms, or exporting the raw
+  buckets to Prometheus and letting it compute rates over a window.
+- **Bucket edges are fixed, `TimeoutMs` isn't.** With `TimeoutMs` = 5000, every timeout
+  lands just above 5000 ms, in overflow, so p95 goes `null` the moment more than 5% of
+  requests time out. Should the edges be derived from config?
 
 ## Running
 

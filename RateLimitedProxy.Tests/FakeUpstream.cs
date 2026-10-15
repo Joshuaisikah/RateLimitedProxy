@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Time.Testing;
 
 namespace RateLimitedProxy.Tests;
 
@@ -15,12 +16,17 @@ namespace RateLimitedProxy.Tests;
 //   /hang           -> never responds (until the caller gives up)
 //   /stall-body     -> sends 200 + headers immediately, then never sends the body
 //   /slow/{ms}      -> waits that many milliseconds, then 200
+//   /advance/{ms}   -> moves Clock (a FakeTimeProvider) forward by ms, then 200 - an exact
+//                      latency as seen by a proxy that reads time from that clock
 //   anything else   -> 200 with a JSON echo of what the upstream actually received
 public sealed class FakeUpstream : IAsyncLifetime
 {
     private WebApplication? _app;
 
     public string BaseUrl { get; private set; } = "";
+
+    // Set by tests that hand the same FakeTimeProvider to the proxy; used by /advance/{ms}.
+    public FakeTimeProvider? Clock { get; set; }
 
     // How many requests reached the upstream. Lets tests prove the proxy really called it.
     private int _hits;
@@ -69,6 +75,13 @@ public sealed class FakeUpstream : IAsyncLifetime
         {
             await Task.Delay(ms, ctx.RequestAborted);
             return Results.Text($"slow {ms}");
+        });
+
+        _app.MapGet("/advance/{ms:int}", (int ms) =>
+        {
+            if (Clock is null) return Results.Text("no clock set", statusCode: 500);
+            Clock.Advance(TimeSpan.FromMilliseconds(ms));
+            return Results.Text($"advanced {ms}");
         });
 
         // Sends status + headers straight away, then never sends the body.
